@@ -1,14 +1,15 @@
 FROM python:3.9.5-slim-buster
 
+RUN apt-get update
+RUN apt-get install poppler-utils -y
+
 RUN pip install pipenv
 
-ADD . /code
+COPY . /code
 WORKDIR /code
 
-ENV FLASK_APP=api.py
+ENV FLASK_APP /code/api.py
 
 RUN pipenv install --system --skip-lock
 
-EXPOSE 5000
-
-CMD python ${FLASK_APP}
+CMD flask run --host=0.0.0.0 --port=5000

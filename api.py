@@ -1,68 +1,164 @@
 import io
-import uuid
+import json
 
 import dramatiq
-from dramatiq.brokers.rabbitmq import RabbitmqBroker
+from dramatiq.brokers.redis import RedisBroker
+from flasgger import Swagger
 from flask import Flask, Response, request
-from flask_sqlalchemy import SQLAlchemy
+from flask.logging import create_logger
 from pdf2image import convert_from_bytes
+from pdf2image.exceptions import PDFPageCountError, PDFSyntaxError
 
+from models import Document, Image, get_db
 from settings import Config
+
 
 api = Flask(__name__)
 api.config.from_object(Config)
 
-db = SQLAlchemy(api)
-db.create_all()
+logger = create_logger(api)
 
-broker = RabbitmqBroker(host=api.config.get('BROKER'))
-dramatiq.set_broker(broker)
+db = get_db(api)
+
+dramatiq.set_broker(RedisBroker(url=api.config.get('REDIS_URL')))
+
+swagger_template = {
+    'swagger': '2.0',
+    'info': {
+        'title': 'Renderer',
+        'description': 'Render normalized PNG images from PDF files',
+        'version': '0.1.0'
+    },
+}
+swagger_config = {
+    'specs': [{'endpoint': '/', 'route': '/swagger.json'}],
+    'specs_route': '/'
+}
+Swagger(api, template=swagger_template, config=swagger_config, merge=True)
 
 
 @api.route('/documents', methods=['POST'])
-def post():
-    result = post_document()
+def post_document():
+    """Add a document
+    ---
+    tags:
+      - Documents
+    parameters:
+      - name: data
+        in: formData
+        type: file
+        required: true
+    consumes:
+      - multipart/form-data
+    responses:
+      201:
+        description: Created
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                uuid:
+                  type: string
+    """
+    result = save_document()
 
     return Response(response=result, status=201, content_type='application/json')
 
 
-@api.route('/documents/<string:uuid>', defaults={'page': None})
-@api.route('/documents/<string:uuid>/<int:page>')
-def get(unique_id, page):
-    result = get_image(unique_id, page) if page else get_document(unique_id)
+@api.route('/documents/<string:uuid>')
+def get_document(uuid):
+    """Get document information
+    ---
+    tags:
+      - Documents
+    parameters:
+      - name: uuid
+        in: path
+        type: string
+        required: true
+    responses:
+      200:
+        description: OK
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                uuid:
+                  type: string
+                ready:
+                  type: boolean
+                pages:
+                  type: integer
+      404:
+        description: Not Found
+    """
+    result = load_document(uuid)
     if not result:
         return Response(status=404)
 
-    content_type = 'image/png' if page else 'application/json'
-
-    return Response(response=result, status=200, content_type=content_type)
+    return Response(response=result, status=200, content_type='application/json')
 
 
-def post_document():
-    document = Documents(request.data)
+@api.route('/documents/<string:uuid>/<int:page>')
+def get_image(uuid, page):
+    """Get an image
+    ---
+    tags:
+      - Documents
+    parameters:
+      - name: uuid
+        in: path
+        type: string
+        required: true
+      - name: page
+        in: path
+        type: integer
+        required: true
+    responses:
+      200:
+        description: OK
+        content:
+          image/png:
+            schema:
+              type: string
+              format: binary
+      404:
+        description: Not Found
+    """
+    result = load_image(uuid, page)
+    if not result:
+        return Response(status=404)
+
+    return Response(response=result, status=200, content_type='image/png')
+
+
+def save_document():
+    document = Document(request.files['data'].stream.read())
 
     db.session.add(document)
     db.session.commit()
 
     process_document.send(document.id)
 
-    return {'uuid': document.uuid}
+    return json.dumps({'uuid': document.uuid})
 
 
-def get_document(unique_id):
-    document = Documents.query.filter_by(uuid=unique_id).first()
+def load_document(uuid):
+    document = Document.query.filter_by(uuid=uuid).first()
     if not document:
         return None
 
-    return {'uuid': document.uuid, 'ready': document.ready, 'pages': document.pages}
+    return json.dumps({'uuid': document.uuid, 'ready': document.ready, 'pages': document.pages})
 
 
-def get_image(unique_id, page):
-    document = Documents.query.filter_by(uuid=unique_id).first()
+def load_image(uuid, page):
+    document = Document.query.filter_by(uuid=uuid).first()
     if not document or not document.ready:
         return None
 
-    image = Images.query.filter_by(document_id=document.id, page=page).first()
+    image = Image.query.filter_by(document_id=document.id, page=page).first()
     if not image:
         return None
 
@@ -71,64 +167,44 @@ def get_image(unique_id, page):
 
 @dramatiq.actor
 def process_document(document_id):
-    document = Documents.query.get(document_id)
-    pages = convert_from_bytes(document.data)
+    with api.app_context():
+        document = Document.query.get(document_id)
 
-    for number, page in enumerate(pages, 1):
-        page = normalize(page)
-        buffer = io.BytesIO()
+        try:
+            pages = convert_from_bytes(document.data)
 
-        page.save(buffer, format='png')
-        image = Images(document_id, number, buffer.getvalue())
+        except (PDFPageCountError, PDFSyntaxError, ValueError) as e:
+            document.ready = False
+            db.session.commit()
+            logger.exception(e)
+            return
 
-        db.session.add(image)
+        for number, page in enumerate(pages, 1):
+            page = normalize(page)
+            buffer = io.BytesIO()
 
-    document.update(ready=True, pages=len(pages))
-    db.session.commit()
+            page.save(buffer, format='png')
+            image = Image(document_id, number, buffer.getvalue())
+
+            db.session.add(image)
+
+        document.ready = True
+        document.pages = len(pages)
+        db.session.commit()
 
 
 def normalize(image, max_width=1200, max_height=1600):
     width, height = image.size
+    ratio = width / height
 
-    if width > max_width or height > max_height:
-        if width / max_width > height / max_height:
-            image = image.resize((max_width, None))
+    if ratio > (max_width / max_height):
+        image = image.resize((max_width, int(max_width / ratio)))
 
-        else:
-            image = image.resize((None, max_height))
+    else:
+        image = image.resize((int(max_height * ratio), max_height))
 
     return image
 
 
-class Documents(db.Model):
-    __tablename__ = 'documents'
-
-    id = db.Column(db.Integer, primary_key=True)
-    uuid = db.Column(db.String(32), unique=True, nullable=False)
-    ready = db.Column(db.Boolean)
-    pages = db.Column(db.Integer)
-    data = db.Column(db.LargeBinary, nullable=False)
-    images = db.relationship('Images', backref='document', lazy=True)
-
-    def __init__(self, data):
-        self.uuid = uuid.uuid4()
-        self.data = data
-
-
-class Images(db.Model):
-    __tablename__ = 'images'
-
-    id = db.Column(db.Integer, primary_key=True)
-    page = db.Column(db.Integer, nullable=False)
-    data = db.Column(db.LargeBinary, nullable=False)
-    document_id = db.Column(db.Integer, db.ForeignKey('document.id'), nullable=False)
-
-    def __init__(self, document_id, page, data):
-        self.document_id = document_id
-        self.page = page
-        self.data = data
-
-
 if __name__ == '__main__':
     api.run(debug=True)
-

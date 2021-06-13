@@ -1,1 +1,4 @@
 .idea
+postgres-data
+redis-data
+Pipfile.lock

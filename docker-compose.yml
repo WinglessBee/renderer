@@ -1,21 +1,48 @@
-version: "3.9"
+version: "3"
+
 services:
-  broker:
-    image: "rabbitmq:3.8.16-management"
+
+  redis:
+    container_name: redis
+    image: "redis:6.2"
+    command: "redis-server"
+    restart: unless-stopped
+    volumes:
+      - "./redis-data:/var/lib/redis"
     ports:
-      - "15672:15672"
-    environment:
-      - RABBITMQ_DEFAULT_USER=rabbit_user
-      - RABBITMQ_DEFAULT_PASS=rabbit_password
+      - 6379:6379
+
   postgres:
+    container_name: postgres
     image: "postgres:13.3"
-    environment:
-      - POSTGRES_USER=db_user
-      - POSTGRES_PASSWORD=db_password
-  api:
-    build: .
+    env_file: "env.conf"
+    restart: unless-stopped
+    volumes:
+      - "./postgres-data:/var/lib/postgresql/data"
     ports:
-      - "5000:5000"
+      - 5432:5432
+
+  flask:
+    container_name: flask
+    image: "local_renderer_api"
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: "env.conf"
+    restart: unless-stopped
+    ports:
+      - 5000:5000
     depends_on:
-      - broker
+      - redis
+      - postgres
+
+  dramatiq:
+    container_name: dramatiq
+    image: "local_renderer_api"
+    command: "python -m dramatiq api"
+    env_file: "env.conf"
+    restart: unless-stopped
+    depends_on:
+      - flask
+      - redis
       - postgres
